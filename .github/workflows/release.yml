@@ -1,0 +1,190 @@
+# Build dos instaladores do Operaí a partir dos repositórios privados.
+#
+# Este repositório é público e não tem código: o workflow faz checkout do
+# desktop (PedroPCardoso/operai-desktop, na tag) e do roteador
+# (PedroPCardoso/operai, pasta router/) por deploy keys somente leitura, builda
+# e publica só os instaladores nas Releases daqui.
+#
+# Só dispara à mão (workflow_dispatch). Cada job de build usa o environment
+# `release`, que exige aprovação. Sem assinatura nem notarização por enquanto
+# (spec do PR #114 do operai-desktop).
+name: Release do Operaí
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag do operai-desktop a buildar (vX.Y.Z). Tem de existir lá e bater com a versão do package.json."
+        required: true
+        type: string
+      operai_ref:
+        description: "Commit ou branch de PedroPCardoso/operai de onde vem o roteador (router/)."
+        required: false
+        default: main
+        type: string
+      publicar:
+        description: "Publicar a release. Desmarcado, a release fica em rascunho (draft)."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.nome }}
+    runs-on: ${{ matrix.os }}
+    environment: release
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nome: windows
+            os: windows-latest
+            script: package:win
+            artefatos: |
+              desktop/release/*-setup.exe
+          - nome: macos
+            os: macos-latest
+            script: package:mac
+            artefatos: |
+              desktop/release/*.dmg
+              desktop/release/*.zip
+          - nome: linux
+            os: ubuntu-latest
+            script: package:linux
+            artefatos: |
+              desktop/release/*.AppImage
+              desktop/release/*.deb
+    steps:
+      - name: Validar a tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::A tag precisa ser vX.Y.Z."
+            exit 1
+          fi
+
+      - name: Checkout do desktop na tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PedroPCardoso/operai-desktop
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          path: desktop
+          persist-credentials: false
+
+      - name: Checkout do roteador (router/)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PedroPCardoso/operai
+          ref: ${{ inputs.operai_ref }}
+          ssh-key: ${{ secrets.OPERAI_DEPLOY_KEY }}
+          path: operai
+          sparse-checkout: router
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
+      - name: Conferir a versão contra a tag
+        shell: bash
+        working-directory: desktop
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          versao="$(node -p "require('./package.json').version")"
+          if [ "v$versao" != "$TAG" ]; then
+            echo "::error::A versão do package.json ($versao) não bate com a tag ($TAG)."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+        with:
+          version: 10.33.0
+          package_json_file: desktop/package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Instalar dependências do desktop
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Instalar dependências do roteador
+        working-directory: operai/router
+        run: pnpm install --frozen-lockfile --ignore-workspace
+
+      - name: Empacotar (sem assinatura)
+        working-directory: desktop
+        run: pnpm ${{ matrix.script }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          OPERAI_ROUTER_DIR: ${{ github.workspace }}/operai/router
+
+      - name: Conferir que o pacote contém o roteador
+        shell: bash
+        working-directory: desktop
+        run: |
+          if ! find release -path '*operai-router/cli.mjs' -type f | grep -q .; then
+            echo "::error::O pacote não contém resources/operai-router/cli.mjs."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: instalador-${{ matrix.nome }}
+          path: ${{ matrix.artefatos }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publicar:
+    name: Criar a release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: instaladores
+          merge-multiple: true
+
+      - name: Criar a release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          PUBLICAR: ${{ inputs.publicar }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::A tag precisa ser vX.Y.Z."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::Já existe uma release $TAG neste repositório."
+            exit 1
+          fi
+          arquivos=()
+          while IFS= read -r -d '' f; do arquivos+=("$f"); done < <(
+            find instaladores -maxdepth 1 -type f \
+              \( -name '*-setup.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.deb' \) -print0)
+          if [ "${#arquivos[@]}" -eq 0 ]; then
+            echo "::error::Nenhum instalador para anexar."
+            exit 1
+          fi
+          flags=(--draft)
+          if [ "$PUBLICAR" = "true" ]; then flags=(); fi
+          gh release create "$TAG" "${arquivos[@]}" \
+            --repo "$REPO" --target "$SHA" --title "Operaí $TAG" \
+            --notes "Instaladores do Operaí $TAG, sem assinatura digital por enquanto (o Windows e o macOS vão avisar na primeira abertura)." \
+            "${flags[@]}"
