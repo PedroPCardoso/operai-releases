@@ -127,6 +127,8 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           OPERAI_ROUTER_DIR: ${{ github.workspace }}/operai/router
+          # O tsc -b do desktop passa de 2 GB de heap e morre no runner do macOS (OOM em 2026-11-24).
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: Conferir que o pacote contém o roteador
         shell: bash
