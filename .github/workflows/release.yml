@@ -50,18 +50,23 @@ jobs:
             script: package:win
             artefatos: |
               desktop/release/*-setup.exe
+              desktop/release/*-setup.exe.blockmap
+              desktop/release/latest.yml
           - nome: macos
             os: macos-latest
             script: package:mac
             artefatos: |
               desktop/release/*.dmg
               desktop/release/*.zip
+              desktop/release/*.blockmap
+              desktop/release/latest-mac.yml
           - nome: linux
             os: ubuntu-latest
             script: package:linux
             artefatos: |
               desktop/release/*.AppImage
               desktop/release/*.deb
+              desktop/release/latest-linux.yml
     steps:
       - name: Validar a tag
         shell: bash
@@ -72,6 +77,14 @@ jobs:
             echo "::error::A tag precisa ser vX.Y.Z."
             exit 1
           fi
+
+      - name: Checkout dos scripts deste repositório
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: releases
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
 
       - name: Checkout do desktop na tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,6 +152,13 @@ jobs:
             exit 1
           fi
 
+      - name: Conferir o feed de atualização
+        shell: bash
+        env:
+          PLATAFORMA: ${{ matrix.nome }}
+          TAG: ${{ inputs.tag }}
+        run: bash releases/scripts/conferir-feed.sh "$PLATAFORMA" desktop/release "$TAG"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: instalador-${{ matrix.nome }}
@@ -176,10 +196,18 @@ jobs:
             echo "::error::Já existe uma release $TAG neste repositório."
             exit 1
           fi
+          # Sem um dos feeds, a plataforma dele ficaria sem atualização (ou presa na versão anterior).
+          for feed in latest.yml latest-mac.yml latest-linux.yml; do
+            if [ ! -f "instaladores/$feed" ]; then
+              echo "::error::Falta $feed entre os artefatos."
+              exit 1
+            fi
+          done
           arquivos=()
           while IFS= read -r -d '' f; do arquivos+=("$f"); done < <(
             find instaladores -maxdepth 1 -type f \
-              \( -name '*-setup.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.deb' \) -print0)
+              \( -name '*-setup.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.deb' \
+                 -o -name '*.blockmap' -o -name 'latest*.yml' \) -print0)
           if [ "${#arquivos[@]}" -eq 0 ]; then
             echo "::error::Nenhum instalador para anexar."
             exit 1
@@ -188,5 +216,5 @@ jobs:
           if [ "$PUBLICAR" = "true" ]; then flags=(); fi
           gh release create "$TAG" "${arquivos[@]}" \
             --repo "$REPO" --target "$SHA" --title "Operaí $TAG" \
-            --notes "Instaladores do Operaí $TAG, sem assinatura digital por enquanto (o Windows e o macOS vão avisar na primeira abertura)." \
+            --notes "Instaladores do Operaí $TAG, sem assinatura digital por enquanto (o Windows e o macOS vão avisar na primeira abertura). Quem já tem o app a partir da versão com atualização automática recebe esta versão sozinho no Windows e no Linux; no Mac o app avisa e abre esta página." \
             "${flags[@]}"
